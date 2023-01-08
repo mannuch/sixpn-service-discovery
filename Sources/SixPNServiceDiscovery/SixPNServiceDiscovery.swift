@@ -15,6 +15,5 @@ public final class SixPNServiceDiscovery<Service: Hashable, Instance: Hashable>:
     public var defaultLookupTimeout: DispatchTimeInterval
     
 
-    public init() {
-    }
+    public init() {}
 }
