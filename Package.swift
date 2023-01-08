@@ -8,21 +8,26 @@ let package = Package(
     products: [
         // Products define the executables and libraries a package produces, and make them visible to other packages.
         .library(
-            name: "sixpn-service-discovery",
-            targets: ["sixpn-service-discovery"]),
+            name: "SixPNServiceDiscovery",
+            targets: ["SixPNServiceDiscovery"]),
     ],
     dependencies: [
         // Dependencies declare other packages that this package depends on.
-        // .package(url: /* package url */, from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-service-discovery.git", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-atomics.git", .upToNextMajor(from: "1.0.0"))
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
         // Targets can depend on other targets in this package, and on products in packages this package depends on.
         .target(
-            name: "sixpn-service-discovery",
-            dependencies: []),
+            name: "SixPNServiceDiscovery",
+            dependencies: [
+                .product(name: "ServiceDiscovery", package: "swift-service-discovery"),
+                .product(name: "Atomics", package: "swift-atomics")
+            ]
+        ),
         .testTarget(
-            name: "sixpn-service-discoveryTests",
-            dependencies: ["sixpn-service-discovery"]),
+            name: "SixPNServiceDiscoveryTests",
+            dependencies: ["SixPNServiceDiscovery"]),
     ]
 )
