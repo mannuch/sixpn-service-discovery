@@ -19,7 +19,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     private let eventLoop: EventLoop
     
     private var services: [Service: [Instance]] = [:]
-    private var subscriptions: [Subscription] = []
+    private var subscriptions: [Service: [Subscription]] = [:]
     
     private var isShutdown: Bool = false
     
@@ -39,8 +39,9 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         self.eventLoop = eventLoop
     }
     
-    public func lookup(_ service: Service, deadline: DispatchTime?, callback: @escaping (Result<[SocketAddress], Error>) -> Void) {
+    public func lookup(_ service: Service, deadline: DispatchTime? = nil, callback: @escaping (Result<[SocketAddress], Error>) -> Void) {
         let promise = self.eventLoop.makePromise(of: [SocketAddress].self)
+        
         self.lookup(service, deadline: deadline?.toNIODeadline())
             .cascade(to: promise)
         
@@ -54,11 +55,48 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
             .whenComplete(callback)
     }
     
-    public func subscribe(to service: Service, onNext nextResultHandler: @escaping (Result<[SocketAddress], Error>) -> Void, onComplete completionHandler: @escaping (CompletionReason) -> Void) -> CancellationToken {
-        return CancellationToken()
+    public func subscribe(
+        to service: Service,
+        onNext nextResultHandler: @escaping (Result<[SocketAddress], Error>) -> Void,
+        onComplete completionHandler: @escaping (CompletionReason) -> Void = { _ in }
+    ) -> CancellationToken {
+        guard !self.isShutdown else {
+            completionHandler(.serviceDiscoveryUnavailable)
+            return CancellationToken(isCancelled: true)
+        }
+        
+        let cancellationToken = CancellationToken(completionHandler: completionHandler)
+        let subscription = Subscription(
+            nextResultHandler: nextResultHandler,
+            completionHandler: completionHandler,
+            cancellationToken: cancellationToken
+        )
+        
+        saveSubscription(subscription, for: service)
+            .flatMap {
+                self.lookup(service)
+            }
+            .whenComplete(nextResultHandler)
+        
+        
+        return cancellationToken
     }
     
-    func lookup(_ service: Service, deadline: NIODeadline?) -> EventLoopFuture<[SocketAddress]> {
+    private func saveSubscription(_ subscription: Subscription, for service: Service) -> EventLoopFuture<Void> {
+        guard self.eventLoop.inEventLoop else {
+            return self.eventLoop.flatSubmit {
+                self.saveSubscription(subscription, for: service)
+            }
+        }
+        
+        var subscriptions = self.subscriptions.removeValue(forKey: service) ?? [Subscription]()
+        subscriptions.append(subscription)
+        self.subscriptions[service] = subscriptions
+        
+        return self.eventLoop.makeSucceededVoidFuture()
+    }
+    
+    private func lookup(_ service: Service, deadline: NIODeadline? = nil) -> EventLoopFuture<[SocketAddress]> {
         // dispatch to event loop thread if necessary
         guard self.eventLoop.inEventLoop else {
             return self.eventLoop.flatSubmit {
@@ -92,20 +130,31 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         
         let promise = self.eventLoop.makePromise(of: Void.self)
         
-        self.queryAllSixPNApps(services)
+        self.checkSixPNExistence(services)
             .hop(to: self.eventLoop)
-            .map { [weak self] in
-                // Query AAAA records for socket addresses of services
-                guard let self else {
-                    promise.succeed(())
+            .whenComplete { [weak self] result in
+                if case let .failure(error) = result {
+                    promise.fail(error)
                     return
                 }
-                var queries = [EventLoopFuture<Void>]()
-                for service in services {
-                    queries.append(self.queryService(service))
+                
+                switch result {
+                case .success:
+                    // Query AAAA records for socket addresses of services
+                    guard let self else {
+                        promise.succeed(())
+                        return
+                    }
+                    var queries = [EventLoopFuture<Void>]()
+                    for service in services {
+                        queries.append(self.queryService(service))
+                    }
+                    EventLoopFuture.andAllSucceed(queries, promise: promise)
+                    
+                case let .failure(error):
+                    promise.fail(error)
                 }
-                EventLoopFuture.andAllSucceed(queries, promise: promise)
-            }.cascadeFailure(to: promise)
+            }
         
         return promise.futureResult
     }
@@ -127,7 +176,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         }
     }
     
-    private func queryAllSixPNApps(_ services: [SixPNService]) -> EventLoopFuture<Void> {
+    private func checkSixPNExistence(_ services: [SixPNService]) -> EventLoopFuture<Void> {
         let promise = self.eventLoop.makePromise(of: Void.self)
         
         logger.info("Querying DNS for all SixPN apps in Fly.io organization...")
@@ -204,9 +253,11 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         self.logger.trace("SixPNServiceDiscovery is shutting down, closing all active queries and subscriptions on this event loop")
         
         // no locks needed as this can only happen once
-        self.subscriptions
-            .filter { !$0.cancellationToken.isCancelled }
-            .forEach { $0.completionHandler(.serviceDiscoveryUnavailable) }
+        self.subscriptions.values.forEach { subscriptions in
+            subscriptions
+                .filter { !$0.cancellationToken.isCancelled }
+                .forEach { $0.completionHandler(.serviceDiscoveryUnavailable) }
+        }
         
         return self.eventLoop.makeSucceededVoidFuture()
     }
