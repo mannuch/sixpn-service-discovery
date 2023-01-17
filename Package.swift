@@ -41,7 +41,8 @@ let package = Package(
             name: "SixPNServiceDiscoveryTests",
             dependencies: [
                 "SixPNServiceDiscovery",
-                .product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay")
+                .product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay"),
+                .product(name: "NIOCore", package: "swift-nio")
             ]
         ),
     ]

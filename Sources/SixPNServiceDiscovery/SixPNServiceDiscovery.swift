@@ -42,6 +42,8 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     public func lookup(_ service: Service, deadline: DispatchTime? = nil, callback: @escaping (Result<[SocketAddress], Error>) -> Void) {
         let promise = self.eventLoop.makePromise(of: [SocketAddress].self)
         
+        self.logger.debug("Looking up '\(service.appName)' instances")
+        
         self.lookup(service, deadline: deadline?.toNIODeadline())
             .cascade(to: promise)
         
@@ -54,7 +56,15 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         
         promise.futureResult
             .always { _ in deadlineTask.cancel() }
-            .whenComplete(callback)
+            .whenComplete { result in
+                switch result {
+                case .success(let instances):
+                    self.logger.debug("Found '\(service.appName)' instances: '\(instances)'")
+                case .failure(let error):
+                    self.logger.debug("Error looking up '\(service.appName)' instances: '\(error)'")
+                }
+                callback(result)
+            }
     }
     
     public func subscribe(
@@ -63,6 +73,8 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         onComplete completionHandler: @escaping (CompletionReason) -> Void = { _ in }
     ) -> CancellationToken {
         
+        self.logger.debug("Subscribing to '\(service.appName)' instance updates")
+        
         let cancellationToken = CancellationToken(completionHandler: completionHandler)
         let subscription = Subscription(
             nextResultHandler: nextResultHandler,
@@ -70,7 +82,14 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
             cancellationToken: cancellationToken
         )
         
-        _ = self.subscribe(to: service, with: subscription)
+        self.subscribe(to: service, with: subscription).whenComplete { result in
+            switch result {
+            case .success:
+                self.logger.debug("Successfully subscribed to '\(service.appName)' instance updates")
+            case .failure(let error):
+                self.logger.debug("Error subscribing to '\(service.appName)': '\(error)'")
+            }
+        }
         
         return cancellationToken
     }
@@ -185,6 +204,7 @@ extension SixPNServiceDiscovery {
         
         guard !instances.isEmpty else {
             // Instances is empty, so try doing a just-in-time DNS lookup of any instances, adding them to the self.services map if found
+            self.logger.debug("No instances of '\(service.appName)' stored, querying DNS again...")
             let queryFuture = self.dnsClient.getTopNClosestInstances(of: service)
                 .hop(to: eventLoop)
                 .recover { _ in [] }

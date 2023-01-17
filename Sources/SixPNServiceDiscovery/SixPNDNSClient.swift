@@ -98,13 +98,13 @@ public final class LiveDNSClient: SixPNDNSClient {
 
 public final class TestDNSClient: SixPNDNSClient {
     public struct Implementation {
-        public var allSixPNApps: @Sendable () -> EventLoopFuture<[String]>
-        public var topNClosestInstances: @Sendable (SixPNService) -> EventLoopFuture<[SocketAddress]>
-        public var close: @Sendable () -> Void
+        public var allSixPNApps: () -> EventLoopFuture<[String]>
+        public var topNClosestInstances: (SixPNService) -> EventLoopFuture<[SocketAddress]>
+        public var close: () -> Void
         public init(
-            allSixPNApps: @Sendable @escaping () -> EventLoopFuture<[String]>,
-            topNClosestInstances: @Sendable @escaping (SixPNService) -> EventLoopFuture<[SocketAddress]>,
-            close: @Sendable @escaping () -> Void
+            allSixPNApps: @escaping () -> EventLoopFuture<[String]>,
+            topNClosestInstances: @escaping (SixPNService) -> EventLoopFuture<[SocketAddress]>,
+            close: @escaping () -> Void
         ) {
             self.allSixPNApps = allSixPNApps
             self.topNClosestInstances = topNClosestInstances
@@ -114,7 +114,7 @@ public final class TestDNSClient: SixPNDNSClient {
     
     public var implementation: Implementation
     
-    public init(implementation: Implementation) {
+    public init(_ implementation: Implementation) {
         self.implementation = implementation
     }
     
@@ -132,11 +132,17 @@ public final class TestDNSClient: SixPNDNSClient {
 }
 
 extension TestDNSClient.Implementation {
-    public static func unimplemented(on eventLoop: EventLoop) -> Self {
+    static func unimplemented(on eventLoop: EventLoop) -> Self {
         .init(
             allSixPNApps: XCTestDynamicOverlay.unimplemented("\(Self.self).allSixPNApps", placeholder: eventLoop.makeSucceededFuture([])),
             topNClosestInstances: XCTestDynamicOverlay.unimplemented("\(Self.self).topNClosestInstances", placeholder: eventLoop.makeSucceededFuture([])),
             close: XCTestDynamicOverlay.unimplemented("\(Self.self).close")
         )
+    }
+}
+
+extension TestDNSClient {
+    public static func unimplemented(on eventLoop: EventLoop) -> Self {
+        return .init(.unimplemented(on: eventLoop))
     }
 }
