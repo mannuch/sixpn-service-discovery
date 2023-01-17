@@ -11,8 +11,8 @@ import Logging
 import XCTestDynamicOverlay
 
 public protocol SixPNDNSClient {
-    func allSixPNApps() -> EventLoopFuture<[String]>
-    func topNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]>
+    func getAllAppNames() -> EventLoopFuture<[String]>
+    func getTopNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]>
     func close() -> Void
 }
 
@@ -21,7 +21,11 @@ public final class LiveDNSClient: SixPNDNSClient {
     private let dnsClient: DNSClient
     private let logger: Logger
     
-    private init(on eventLoop: EventLoop, dnsClient: DNSClient, logger: Logger) {
+    private init(
+        on eventLoop: EventLoop,
+        dnsClient: DNSClient,
+        logger: Logger = .init(label: "swift-service-discovery.sixpn.dns-client")
+    ) {
         self.eventLoop = eventLoop
         self.dnsClient = dnsClient
         self.logger = logger
@@ -33,7 +37,7 @@ public final class LiveDNSClient: SixPNDNSClient {
         }
     }
     
-    public func allSixPNApps() -> EventLoopFuture<[String]> {
+    public func getAllAppNames() -> EventLoopFuture<[String]> {
         let promise = self.eventLoop.makePromise(of: [String].self)
         self.dnsClient.sendQuery(forHost: "_apps.internal", type: .txt).whenComplete { result in
             guard case let .success(message) = result else {
@@ -64,7 +68,7 @@ public final class LiveDNSClient: SixPNDNSClient {
         return promise.futureResult
     }
     
-    public func topNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]> {
+    public func getTopNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]> {
         let promise = self.eventLoop.makePromise(of: [SocketAddress].self)
         
         self.dnsClient.initiateAAAAQuery(
@@ -114,11 +118,11 @@ public final class TestDNSClient: SixPNDNSClient {
         self.implementation = implementation
     }
     
-    public func allSixPNApps() -> EventLoopFuture<[String]> {
+    public func getAllAppNames() -> EventLoopFuture<[String]> {
         implementation.allSixPNApps()
     }
     
-    public func topNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]> {
+    public func getTopNClosestInstances(of service: SixPNService) -> EventLoopFuture<[SocketAddress]> {
         implementation.topNClosestInstances(service)
     }
     
