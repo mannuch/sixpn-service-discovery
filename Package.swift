@@ -19,6 +19,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-service-discovery.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-atomics.git", .upToNextMajor(from: "1.0.0")),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
+        .package(url: "https://github.com/vapor/async-kit.git", from: "1.0.0"),
+        .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay.git", from: "0.4.1"),
         .package(url: "https://github.com/OpenKitten/NioDNS.git", from: "2.0.0")
     ],
     targets: [
@@ -30,11 +32,17 @@ let package = Package(
                 .product(name: "ServiceDiscovery", package: "swift-service-discovery"),
                 .product(name: "Atomics", package: "swift-atomics"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "AsyncKit", package: "async-kit"),
+                .product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay"),
                 .product(name: "DNSClient", package: "NioDNS")
             ]
         ),
         .testTarget(
             name: "SixPNServiceDiscoveryTests",
-            dependencies: ["SixPNServiceDiscovery"]),
+            dependencies: [
+                "SixPNServiceDiscovery",
+                .product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay")
+            ]
+        ),
     ]
 )

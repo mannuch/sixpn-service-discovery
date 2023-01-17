@@ -1,6 +1,15 @@
 {
   "pins" : [
     {
+      "identity" : "async-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/vapor/async-kit.git",
+      "state" : {
+        "revision" : "9acea4c92f51a5885c149904f0d11db4712dda80",
+        "version" : "1.16.0"
+      }
+    },
+    {
       "identity" : "niodns",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/OpenKitten/NioDNS.git",
@@ -52,6 +61,15 @@
       "state" : {
         "revision" : "c83afedb1c95ef0111907cd6e2fd03d7175cc0d0",
         "version" : "1.2.0"
+      }
+    },
+    {
+      "identity" : "xctest-dynamic-overlay",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/pointfreeco/xctest-dynamic-overlay.git",
+      "state" : {
+        "revision" : "16b23a295fa322eb957af98037f86791449de60f",
+        "version" : "0.8.1"
       }
     }
   ],

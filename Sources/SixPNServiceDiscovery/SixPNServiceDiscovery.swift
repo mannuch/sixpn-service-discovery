@@ -4,7 +4,7 @@ import ServiceDiscovery
 import NIO
 import Atomics
 import Logging
-import struct NIOConcurrencyHelpers.NIOLock
+import AsyncKit
 
 public final class SixPNServiceDiscovery: ServiceDiscovery {
     public typealias Service = SixPNService
@@ -14,7 +14,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     
     let logger: Logger
     
-    private let dnsClient: DNSClient
+    private let dnsClient: any SixPNDNSClient
     
     private let eventLoop: EventLoop
     
@@ -28,7 +28,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     }
     
     public init(
-        dnsClient: DNSClient,
+        dnsClient: any SixPNDNSClient,
         defaultLookupTimeout: TimeAmount,
         logger: Logger = .init(label: "swift-service-discovery.sixpn"),
         on eventLoop: EventLoop
@@ -46,7 +46,9 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
             .cascade(to: promise)
         
         
-        let deadlineTask = self.eventLoop.scheduleTask(deadline: deadline?.toNIODeadline() ?? .now() + self._defaultLookupTimeout) {
+        let deadlineTask = self.eventLoop.scheduleTask(
+            deadline: deadline?.toNIODeadline() ?? .now() + self._defaultLookupTimeout
+        ) {
             promise.fail(LookupError.timedOut)
         }
         
@@ -73,10 +75,14 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         )
         
         saveSubscription(subscription, for: service)
-            .flatMap {
-                self.lookup(service)
+            .whenComplete { result in
+                switch result {
+                case .success:
+                    self.lookup(service, callback: nextResultHandler)
+                case .failure:
+                    cancellationToken.cancel()
+                }
             }
-            .whenComplete(nextResultHandler)
         
         
         return cancellationToken
@@ -112,6 +118,18 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
             return self.eventLoop.makeFailedFuture(LookupError.unknownService)
         }
         
+        guard !instances.isEmpty else {
+            // Instances is empty, so try doing a just-in-time DNS lookup of any instances, adding them to the self.services map if found
+            let queryFuture = self.dnsClient.topNClosestInstances(of: service)
+                .hop(to: eventLoop)
+                .recover { _ in [] }
+            queryFuture.whenSuccess { instances in
+                guard !instances.isEmpty else { return }
+                self.services[service] = instances
+            }
+            return queryFuture
+        }
+        
         return self.eventLoop.makeSucceededFuture(instances)
     }
     
@@ -128,111 +146,77 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         }
         
         
-        let promise = self.eventLoop.makePromise(of: Void.self)
-        
-        self.checkSixPNExistence(services)
-            .hop(to: self.eventLoop)
-            .whenComplete { [weak self] result in
-                if case let .failure(error) = result {
-                    promise.fail(error)
-                    return
-                }
-                
-                switch result {
-                case .success:
-                    // Query AAAA records for socket addresses of services
-                    guard let self else {
-                        promise.succeed(())
-                        return
-                    }
-                    var queries = [EventLoopFuture<Void>]()
-                    for service in services {
-                        queries.append(self.queryService(service))
-                    }
-                    EventLoopFuture.andAllSucceed(queries, promise: promise)
-                    
-                case let .failure(error):
-                    promise.fail(error)
-                }
-            }
-        
-        return promise.futureResult
-    }
-    
-    private func queryService(_ service: SixPNService) -> EventLoopFuture<Void> {
-        self.logger.info("Looking for top \(service.topNClosestInstances) closest instances of service ['\(service.appName)', port: \(service.port)]")
-        
-        return self.dnsClient.initiateAAAAQuery(
-            host: "top\(service.topNClosestInstances).nearest.of.\(service.appName).internal",
-            port: Int(service.port)
-        )
-        .hop(to: self.eventLoop)
-        .map { [weak self] socketAddresses in
-            guard let self else { return }
-            
-            self.logger.info("Found \(socketAddresses.count) instances of service ['\(service.appName)', port: \(service.port)]")
-            
-            self.services[service] = socketAddresses
-        }
-    }
-    
-    private func checkSixPNExistence(_ services: [SixPNService]) -> EventLoopFuture<Void> {
-        let promise = self.eventLoop.makePromise(of: Void.self)
-        
         logger.info("Querying DNS for all SixPN apps in Fly.io organization...")
         
-        promise.futureResult.whenComplete { [weak self] result in
-            switch result {
-            case .success:
-                self?.logger.info("Found all queried service apps in SixPN network")
-            case .failure(let error):
-                self?.logger.error("Error querying service apps in SixPN network: '\(error)'")
-            }
-        }
+        let promise = self.eventLoop.makePromise(of: Void.self)
         
-        self.dnsClient.sendQuery(forHost: "_apps.internal", type: .txt).whenComplete { result in
-            guard case let .success(message) = result else {
-                if case let .failure(error) = result {
-                    promise.fail(error)
+        self.dnsClient.allSixPNApps()
+            .hop(to: self.eventLoop)
+            .flatMapThrowing { appNames in
+                var notFound = [SixPNService]()
+                
+                services.forEach { service in
+                    if !appNames.contains(service.appName) {
+                        notFound.append(service)
+                    }
                 }
-                return
-            }
+                
+                guard notFound.isEmpty else {
+                    self.logger.error("The following service apps were NOT found in SixPN network: \(notFound)")
+                    throw SixPNError.servicesNotFound(notFound)
+                }
+            }.cascade(to: promise)
+        
+        promise.futureResult.whenSuccess {
+            self.logger.info("Found all service apps in SixPN network")
             
-            
-            guard !message.answers.isEmpty else {
-                promise.fail(
-                    SixPNError.txtRecordLookup(message: "The DNS Query message did not have any answers.")
-                )
-                return
-            }
-            
-            guard case let .txt(txtRecord) = message.answers[0] else {
-                promise.fail(
-                    SixPNError.txtRecordLookup(message: "The first answer of the DNS Query message was not a TXT record.")
-                )
-                return
-            }
-            
-            let appNames = txtRecord.resource.rawValues[0].split(separator: ",").map { String($0) }
-            
-            var notFound = [SixPNService]()
-            
+            // Initialize registered services
             services.forEach { service in
-                if !appNames.contains(service.appName) {
-                    notFound.append(service)
-                }
+                self.services[service] = []
             }
             
-            guard notFound.isEmpty else {
-                promise.fail(SixPNError.servicesNotFound(notFound))
-                return
-            }
-            
-            promise.succeed(())
+            // Kick off repeated task that continually updates service instances
+            self.updateServiceInstances()
         }
         
         return promise.futureResult
-        
+    }
+    
+    private func updateServiceInstances() {
+        // Schedule task to continually update instances
+        self.eventLoop.scheduleRepeatedAsyncTask(initialDelay: .zero, delay: .minutes(1)) { [weak self, eventLoop = self.eventLoop] task in
+            guard let self, !self.isShutdown else {
+                task.cancel()
+                return eventLoop.makeSucceededVoidFuture()
+            }
+            self.logger.info("Updating service instances...")
+            let promise = eventLoop.makePromise(of: [(SixPNService, [SocketAddress])].self)
+            
+            self.services.keys.sequencedFlatMapEach(on: self.eventLoop) { service in
+                self.logger.info("Looking for top \(service.topNClosestInstances) closest instances of service ['\(service.appName)', port: \(service.port)]")
+                return self.dnsClient.topNClosestInstances(of: service)
+                    .hop(to: eventLoop)
+                    .map { instances in (service, instances) }
+                    .recover { _ in
+                        (service, [])
+                    }
+            }.cascade(to: promise)
+            
+            promise.futureResult.whenSuccess {
+                for (service, instances) in $0 {
+                    let prevInstances = self.services[service]
+                    self.services[service] = instances
+                    
+                    if !self.isShutdown, prevInstances != instances, let subscription = self.subscriptions[service] {
+                        subscription
+                            .filter { !$0.cancellationToken.isCancelled }
+                            .forEach { $0.nextResultHandler(.success(instances)) }
+                    }
+                }
+            }
+            
+            return promise.futureResult.map { _ in }
+        }
     }
     
     public func shutdown() -> EventLoopFuture<Void> {
@@ -249,7 +233,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         }
         
         self.isShutdown = true
-        self.dnsClient.cancelQueries()
+        self.dnsClient.close()
         self.logger.trace("SixPNServiceDiscovery is shutting down, closing all active queries and subscriptions on this event loop")
         
         // no locks needed as this can only happen once
@@ -281,29 +265,7 @@ extension SixPNServiceDiscovery {
     }
 }
 
-extension SixPNServiceDiscovery {
-    public enum SixPNError: Error, CustomStringConvertible {
-        case unknown
-        case txtRecordLookup(message: String)
-        case servicesNotFound([SixPNService])
-        case shutdown
-        
-        public var description: String {
-            switch self {
-            case .unknown:
-                return "Unknown"
-            case .shutdown:
-                return "SixPNServiceDiscovery is shutdown"
-            case let .servicesNotFound(notFoundServices):
-                return "Could not find services: \(notFoundServices.map { $0.description })"
-            case let .txtRecordLookup(message):
-                return "Error during TXT record DNS query: '\(message)'"
-            }
-        }
-    }
-}
-
-public struct SixPNService: Hashable {
+public struct SixPNService: Hashable, Equatable {
     public let appName: String
     public let port: UInt
     public let topNClosestInstances: UInt = 1
@@ -319,11 +281,35 @@ public struct SixPNService: Hashable {
         self.appName = appName
         self.port = port
     }
+    
+    public static func ==(lhs: Self, rhs: Self) -> Bool {
+        return lhs.appName == rhs.appName && lhs.port == rhs.port
+    }
 }
 
 extension DispatchTime {
     func toNIODeadline() -> NIODeadline {
         NIODeadline.uptimeNanoseconds(self.uptimeNanoseconds)
+    }
+}
+
+public enum SixPNError: Error, CustomStringConvertible {
+    case unknown
+    case txtRecordLookup(message: String)
+    case servicesNotFound([SixPNService])
+    case shutdown
+    
+    public var description: String {
+        switch self {
+        case .unknown:
+            return "Unknown"
+        case .shutdown:
+            return "SixPNServiceDiscovery is shutdown"
+        case let .servicesNotFound(notFoundServices):
+            return "Could not find services: \(notFoundServices.map { $0.description })"
+        case let .txtRecordLookup(message):
+            return "Error during TXT record DNS query: '\(message)'"
+        }
     }
 }
 
