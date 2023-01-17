@@ -261,16 +261,31 @@ extension SixPNServiceDiscovery {
             
             self.services.keys.sequencedFlatMapEach(on: self.eventLoop) { service in
                 self.logger.info("Looking for top \(service.topNClosestInstances) closest instances of service ['\(service.appName)', port: \(service.port)]")
-                return self.dnsClient.getTopNClosestInstances(of: service)
+                let lookupPromise = eventLoop.makePromise(of: (SixPNService, [SocketAddress]).self)
+                // Each update should timeout after self._defaultLookupTimeout
+                let timeoutTask = eventLoop.scheduleTask(in: self._defaultLookupTimeout, {
+                    struct TimeoutError: Error {}
+                    self.logger.debug("Updating instances of service ['\(service.appName)', port: \(service.port)] timed out")
+                    lookupPromise.fail(TimeoutError())
+                })
+                
+                self.dnsClient.getTopNClosestInstances(of: service)
                     .hop(to: eventLoop)
                     .map { instances in (service, instances) }
+                    .cascade(to: lookupPromise)
+                
+                return lookupPromise.futureResult
                     .recover { _ in
+                        // Erase all errors to an empty instance array
+                        // lookup errors should only be propagated to users during calls to self.lookup(to:deadline:callback:)
                         (service, [])
                     }
+                    .always {_ in timeoutTask.cancel() }
             }.cascade(to: promise)
             
             promise.futureResult.whenSuccess {
                 for (service, instances) in $0 {
+                    // Notify subscriptions of instance updates, if any
                     let prevInstances = self.services[service]
                     self.services[service] = instances
                     
