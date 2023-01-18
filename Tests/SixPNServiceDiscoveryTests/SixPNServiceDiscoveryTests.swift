@@ -433,7 +433,7 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
             XCTFail("First batch of instances of subscription returned an error")
             return
         }
-        XCTAssertEqual(firstInstances, [try! .init(ipAddress: "::1", port: 80)])
+        XCTAssertEqual(firstInstances, [try! .init(ipAddress: "::2", port: 80)])
         
         eventLoop.advanceTime(by: .milliseconds(1500)) // Advance time by 1.5 seconds, enough time for an instance update round to complete
         
@@ -441,15 +441,125 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
             XCTFail("Second batch of instances of subscription returned an error")
             return
         }
-        XCTAssertEqual(secondInstances, [try! .init(ipAddress: "::2", port: 80)])
+        XCTAssertEqual(secondInstances, [try! .init(ipAddress: "::3", port: 80)])
         
     }
     
     func testSubscribeWithContinuedInstanceError() throws {
+        let eventLoop = EmbeddedEventLoop()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        dnsClient.implementation.topNClosestInstances = { _ in
+                eventLoop.makeFailedFuture(TestError())
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .seconds(1),
+            updateInterval: .seconds(1),
+            on: eventLoop
+        )
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        
+        eventLoop.advanceTime(by: .milliseconds(100)) // Advance time to let findAndRegister() work complete
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        let promise2 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        let onCompletionPromise = eventLoop.makePromise(of: CompletionReason.self)
+        
+        let updateCount = ManagedAtomic<Int>(0)
+        let cancellationToken = serviceDiscovery.subscribe(to: service1) { updateResult in
+            let count = updateCount.load(ordering: .acquiring)
+            defer { updateCount.wrappingIncrement(ordering: .relaxed) }
+            switch count {
+            case 0: promise1.succeed(updateResult)
+            case 1: promise2.succeed(updateResult)
+            default: XCTFail("nextResultHandler called too many times")
+            }
+        } onComplete: { completionReason in
+            onCompletionPromise.succeed(completionReason)
+        }
+        
+        guard case let .failure(error1) = try? promise1.futureResult.wait() else {
+            XCTFail("nextResultHandler should have returned an error")
+            return
+        }
+        
+        XCTAssertTrue(error1 is TestError)
+        
+        eventLoop.advanceTime(by: .milliseconds(1500)) // Advance time by 1.5 seconds, enough time for an instance update round to complete
+        
+        guard case let .failure(error2) = try? promise2.futureResult.wait() else {
+            XCTFail("nextResultHandler should have returned an error")
+            return
+        }
+        XCTAssertTrue(error2 is TestError)
+        
+        XCTAssertFalse(cancellationToken.isCancelled)
+        
+        cancellationToken.cancel()
+        
+        guard let completionReason = try? onCompletionPromise.futureResult.wait() else {
+            XCTFail("Should have returned completion reason")
+            return
+        }
+        
+        XCTAssertEqual(completionReason, .cancellationRequested)
+        XCTAssertTrue(cancellationToken.isCancelled)
         
     }
     
     func testSubscribeShutdown() throws {
-        
+        let eventLoop = EmbeddedEventLoop()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+
+        dnsClient.implementation.topNClosestInstances = { _ in
+                eventLoop.makeSucceededFuture([])
+        }
+        dnsClient.implementation.close = {}
+
+        let service1 = SixPNService(appName: "s1", port: 80)
+
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .seconds(1),
+            on: eventLoop
+        )
+
+
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+
+        try! serviceDiscovery.shutdown().wait()
+
+        eventLoop.advanceTime(by: .milliseconds(100))
+
+        let onCompletionPromise = eventLoop.makePromise(of: CompletionReason.self)
+
+        let cancellationToken = serviceDiscovery.subscribe(to: service1) { updateResult in
+            XCTFail("nextResultHandler should not have been called")
+        } onComplete: { completionReason in
+            onCompletionPromise.succeed(completionReason)
+        }
+
+        guard let completionReason = try? onCompletionPromise.futureResult.wait() else {
+            XCTFail("Failed getting completion reason")
+            return
+        }
+
+        XCTAssertEqual(completionReason, .serviceDiscoveryUnavailable)
+        XCTAssertTrue(cancellationToken.isCancelled)
     }
 }

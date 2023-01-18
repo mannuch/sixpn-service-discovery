@@ -12,6 +12,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     
     private let _defaultLookupTimeout: TimeAmount
     private let updateInterval: TimeAmount
+    private let cleanupInterval: TimeAmount
     
     private let logger: Logger
     
@@ -19,10 +20,14 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     
     private let eventLoop: EventLoop
     
-    private var services: [Service: [Instance]] = [:]
+    private var services: [Service] = []
     private var subscriptions: [Service: [Subscription]] = [:]
     
-    private var isShutdown: Bool = false
+    private let _isShutdown = ManagedAtomic<Bool>(false)
+    
+    public var isShutdown: Bool {
+        self._isShutdown.load(ordering: .acquiring)
+    }
     
     public var defaultLookupTimeout: DispatchTimeInterval {
         .nanoseconds(Int(_defaultLookupTimeout.nanoseconds))
@@ -32,22 +37,27 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         dnsClient: any SixPNDNSClient,
         defaultLookupTimeout: TimeAmount,
         updateInterval: TimeAmount = .minutes(1),
+        cleanupInterval: TimeAmount = .minutes(1),
         logger: Logger = .init(label: "swift-service-discovery.sixpn"),
         on eventLoop: EventLoop
     ) {
         self._defaultLookupTimeout = defaultLookupTimeout
         self.updateInterval = updateInterval
+        self.cleanupInterval = cleanupInterval
         self.dnsClient = dnsClient
         self.logger = logger
         self.eventLoop = eventLoop
     }
     
     public func lookup(_ service: Service, deadline: DispatchTime? = nil, callback: @escaping (Result<[SocketAddress], Error>) -> Void) {
+        guard !self.isShutdown else {
+            callback(.failure(ServiceDiscoveryError.unavailable))
+            return
+        }
+        
         let promise = self.eventLoop.makePromise(of: [SocketAddress].self)
         
         self.logger.debug("Looking up '\(service.appName)' instances")
-        
-        
         
         var timeout: TimeAmount?
         if let deadline {
@@ -84,6 +94,11 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         
         self.logger.debug("Subscribing to '\(service.appName)' instance updates")
         
+        guard !self.isShutdown else {
+            completionHandler(.serviceDiscoveryUnavailable)
+            return CancellationToken(isCancelled: true)
+        }
+        
         let cancellationToken = CancellationToken(completionHandler: completionHandler)
         let subscription = Subscription(
             nextResultHandler: nextResultHandler,
@@ -112,7 +127,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         }
         
         guard !self.isShutdown else {
-            return self.eventLoop.makeFailedFuture(SixPNError.shutdown)
+            return self.eventLoop.makeFailedFuture(ServiceDiscoveryError.unavailable)
         }
         
         
@@ -140,9 +155,9 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         promise.futureResult.whenSuccess {
             self.logger.info("Found all service apps in SixPN network")
             
-            // Initialize registered services
+            // Register services
             services.forEach { service in
-                self.services[service] = []
+                self.services.append(service)
             }
             
             // Kick off repeated task that continually updates service instances
@@ -162,12 +177,11 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
             }
         }
         
-        // check to make sure we aren't double closing
-        guard !self.isShutdown else {
+        // Change _isShudown from false to true, but if already true just return
+        guard self._isShutdown.compareExchange(expected: false, desired: true, ordering: .acquiring).exchanged else {
             return self.eventLoop.makeSucceededVoidFuture()
         }
         
-        self.isShutdown = true
         self.dnsClient.close()
         self.logger.trace("SixPNServiceDiscovery is shutting down, closing all active queries and subscriptions on this event loop")
         
@@ -203,27 +217,11 @@ extension SixPNServiceDiscovery {
             }
         }
         
-        guard !self.isShutdown else {
-            return self.eventLoop.makeFailedFuture(ServiceDiscoveryError.unavailable)
-        }
-        
-        guard let instances = self.services[service] else {
+        guard self.services.contains(service) else {
             return self.eventLoop.makeFailedFuture(LookupError.unknownService)
         }
         
-        guard !instances.isEmpty else {
-            // Instances is empty, so try doing a just-in-time DNS lookup of any instances, adding them to the self.services map if found
-            self.logger.debug("No instances of '\(service.appName)' stored, querying DNS again...")
-            let queryFuture = self.dnsClient.getTopNClosestInstances(of: service)
-                .hop(to: eventLoop)
-            queryFuture.whenSuccess { instances in
-                guard !instances.isEmpty else { return }
-                self.services[service] = instances
-            }
-            return queryFuture
-        }
-        
-        return self.eventLoop.makeSucceededFuture(instances)
+        return self.dnsClient.getTopNClosestInstances(of: service).hop(to: eventLoop)
     }
     
     private func subscribe(
@@ -237,20 +235,13 @@ extension SixPNServiceDiscovery {
             }
         }
         
-        guard !self.isShutdown else {
-            subscription.cancellationToken.cancel()
-            return self.eventLoop.makeSucceededVoidFuture()
-        }
-        
-        
         var subscriptions = self.subscriptions.removeValue(forKey: service) ?? [Subscription]()
         subscriptions.append(subscription)
         self.subscriptions[service] = subscriptions
         
         
         self.lookup(service)
-            .always(subscription.nextResultHandler)
-            .whenFailure { _ in subscription.cancellationToken.cancel() }
+            .whenComplete(subscription.nextResultHandler)
             
         
         return self.eventLoop.makeSucceededVoidFuture()
@@ -265,47 +256,56 @@ extension SixPNServiceDiscovery {
                 return eventLoop.makeSucceededVoidFuture()
             }
             self.logger.info("Updating service instances...")
-            let promise = eventLoop.makePromise(of: [(SixPNService, [SocketAddress])].self)
+            let promise = eventLoop.makePromise(of: [(SixPNService, Result<[SocketAddress], Error>)].self)
             
-            self.services.keys.sequencedFlatMapEach(on: self.eventLoop) { service in
+            self.services.sequencedFlatMapEach(on: self.eventLoop) { service in
                 self.logger.info("Looking for top \(service.topNClosestInstances) closest instances of service ['\(service.appName)', port: \(service.port)]")
-                let lookupPromise = eventLoop.makePromise(of: (SixPNService, [SocketAddress]).self)
+                let lookupPromise = eventLoop.makePromise(of: [SocketAddress].self)
                 // Each update should timeout after the default lookup timeout
                 let timeoutTask = eventLoop.scheduleTask(in: self._defaultLookupTimeout, {
-                    struct TimeoutError: Error {}
-                    self.logger.debug("Updating instances of service ['\(service.appName)', port: \(service.port)] timed out")
-                    lookupPromise.fail(TimeoutError())
+                    self.logger.warning("Updating instances of service ['\(service.appName)', port: \(service.port)] timed out")
+                    lookupPromise.fail(ServiceDiscoveryError.other("Time out updating instances of service ['\(service.appName)', port: \(service.port)]"))
                 })
                 
                 self.dnsClient.getTopNClosestInstances(of: service)
                     .hop(to: eventLoop)
-                    .map { instances in (service, instances) }
                     .cascade(to: lookupPromise)
                 
                 return lookupPromise.futureResult
-                    .recover { _ in
-                        // Erase all errors to an empty instance array
-                        // lookup errors should only be propagated to users during calls to self.lookup(to:deadline:callback:)
-                        (service, [])
-                    }
                     .always {_ in timeoutTask.cancel() }
-            }.cascade(to: promise)
+                    .map { instances in (service, .success(instances)) } // Map successful lookups to (SixPNService, Result.success([SocketAddress]))
+                    .recover { error in (service, .failure(error)) } // Map failed lookups to (SixPNService, Result.failure(Error))
+            }
+            .cascade(to: promise)
             
             promise.futureResult.whenSuccess {
-                for (service, instances) in $0 {
-                    // Notify subscriptions of instance updates, if any
-                    let prevInstances = self.services[service]
-                    self.services[service] = instances
-                    
-                    if !self.isShutdown, prevInstances != instances, let subscription = self.subscriptions[service] {
-                        subscription
+                for (service, instanceUpdateResult) in $0 {
+                    // Notify subscriptions of instance updates
+                    if !self.isShutdown, let subscriptions = self.subscriptions[service] {
+                        subscriptions
                             .filter { !$0.cancellationToken.isCancelled }
-                            .forEach { $0.nextResultHandler(.success(instances)) }
+                            .forEach { $0.nextResultHandler(instanceUpdateResult) }
                     }
                 }
             }
             
             return promise.futureResult.map { _ in }
+        }
+    }
+    
+    private func cleanupSubscriptions() {
+        // Schedule task to continually clean up any cancelled subscriptions
+        self.eventLoop.scheduleRepeatedTask(initialDelay: self.cleanupInterval, delay: self.cleanupInterval) { [weak self] task in
+            guard let self, !self.isShutdown else {
+                task.cancel()
+                return
+            }
+            
+            for service in self.subscriptions.keys {
+                self.subscriptions[service]?.removeAll(where: {
+                    $0.cancellationToken.isCancelled
+                })
+            }
         }
     }
 }
@@ -336,5 +336,32 @@ extension DispatchTimeInterval {
             return nil
         }
     }
+}
+
+extension Optional<Result<[SocketAddress], Error>> {
+    func equals(_ other: Result<[SocketAddress], Error>?) -> Bool {
+        switch (self, other) {
+        case (.none, .some), (.some, .none):
+            return false
+        case (.some(let result), .some(let otherResult)):
+            return result.equals(otherResult)
+        case (.none, .none):
+            return true
+        }
+    }
+}
+
+extension Result<[SocketAddress], Error> {
+    func equals(_ other: Result<[SocketAddress], Error>) -> Bool {
+        switch (self, other) {
+        case (.success(let instances), .success(let otherInstances)):
+            return instances == otherInstances
+        case (.success, .failure), (.failure, .success):
+            return false
+        case (.failure, .failure):
+            return false
+        }
+    }
+    
 }
 
