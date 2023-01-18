@@ -44,15 +44,21 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
         
         self.logger.debug("Looking up '\(service.appName)' instances")
         
-        self.lookup(service, deadline: deadline?.toNIODeadline())
-            .cascade(to: promise)
         
+        
+        var timeout: TimeAmount?
+        if let deadline {
+            timeout = DispatchTime.now().distance(to: deadline).toNIOTimeAmount()
+        }
         
         let deadlineTask = self.eventLoop.scheduleTask(
-            deadline: deadline?.toNIODeadline() ?? .now() + self._defaultLookupTimeout
+            in: timeout ?? self._defaultLookupTimeout
         ) {
             promise.fail(LookupError.timedOut)
         }
+        
+        self.lookup(service)
+            .cascade(to: promise)
         
         promise.futureResult
             .always { _ in deadlineTask.cancel() }
@@ -186,11 +192,11 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
 
 // MARK: Private methods
 extension SixPNServiceDiscovery {
-    private func lookup(_ service: Service, deadline: NIODeadline? = nil) -> EventLoopFuture<[SocketAddress]> {
+    private func lookup(_ service: Service) -> EventLoopFuture<[SocketAddress]> {
         // dispatch to event loop thread if necessary
         guard self.eventLoop.inEventLoop else {
             return self.eventLoop.flatSubmit {
-                self.lookup(service, deadline: deadline)
+                self.lookup(service)
             }
         }
         
@@ -207,7 +213,6 @@ extension SixPNServiceDiscovery {
             self.logger.debug("No instances of '\(service.appName)' stored, querying DNS again...")
             let queryFuture = self.dnsClient.getTopNClosestInstances(of: service)
                 .hop(to: eventLoop)
-                .recover { _ in [] }
             queryFuture.whenSuccess { instances in
                 guard !instances.isEmpty else { return }
                 self.services[service] = instances
@@ -311,9 +316,22 @@ extension SixPNServiceDiscovery {
 }
 
 
-extension DispatchTime {
-    func toNIODeadline() -> NIODeadline {
-        NIODeadline.uptimeNanoseconds(self.uptimeNanoseconds)
+extension DispatchTimeInterval {
+    func toNIOTimeAmount() -> TimeAmount? {
+        switch self {
+        case .seconds(let int):
+            return .seconds(Int64(int))
+        case .milliseconds(let int):
+            return .milliseconds(Int64(int))
+        case .microseconds(let int):
+            return .microseconds(Int64(int))
+        case .nanoseconds(let int):
+            return .nanoseconds(Int64(int))
+        case .never:
+            return .zero
+        default:
+            return nil
+        }
     }
 }
 

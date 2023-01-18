@@ -1,6 +1,7 @@
 import XCTest
 import NIO
 import Atomics
+import ServiceDiscovery
 @testable import SixPNServiceDiscovery
 
 final class SixPNServiceDiscoveryTests: XCTestCase {
@@ -251,13 +252,87 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
         
         do {
             _ = try promise1.futureResult.wait().get()
-            XCTAssert(true, "Should have thrown error")
+            XCTFail("Should have thrown error")
         } catch {
             XCTAssertTrue(error is TestError)
         }
     }
     
-    func testLookupTimeout() throws {
+    func testLookupTimeoutWithDefault() throws {
+        let eventLoop = eventLoopGroup.next()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
         
+        dnsClient.implementation.topNClosestInstances = { _ in
+            // Simulate long-running future
+            return eventLoop.scheduleTask(in: .seconds(1)) {
+                return []
+            }.futureResult
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .milliseconds(100),
+            on: eventLoop
+        )
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        
+        serviceDiscovery.lookup(service1) {
+            promise1.succeed($0)
+        }
+        
+        XCTAssertThrowsError(try promise1.futureResult.wait().get(), "Lookup should have timed out and returned LookupError.timedOut") { error in
+            XCTAssertEqual(error as? LookupError, LookupError.timedOut)
+        }
+    }
+    
+    func testLookupTimeoutWithCustomDeadline() throws {
+        let eventLoop = eventLoopGroup.next()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        dnsClient.implementation.topNClosestInstances = { _ in
+            return eventLoop.scheduleTask(in: .seconds(1)) {
+                return []
+            }.futureResult
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .seconds(2), // Set long default timeout
+            on: eventLoop
+        )
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        
+        serviceDiscovery.lookup(
+            service1,
+            deadline: .now() + .milliseconds(10) // Override long default timeout
+        ) {
+            promise1.succeed($0)
+        }
+        
+        XCTAssertThrowsError(try promise1.futureResult.wait().get(), "Lookup should have timed out and returned LookupError.timedOut") { error in
+            XCTAssertEqual(error as? LookupError, LookupError.timedOut)
+        }
     }
 }
