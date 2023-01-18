@@ -8,9 +8,13 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
     var eventLoopGroup: MultiThreadedEventLoopGroup!
     var dnsClient: TestDNSClient!
     
-    override func setUp() async throws {
+    override func setUp() {
         eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         dnsClient = .unimplemented(on: eventLoopGroup.any())
+    }
+    
+    override func tearDown() {
+        try! eventLoopGroup.syncShutdownGracefully()
     }
     
     struct TestError: Error {}
@@ -334,5 +338,118 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
         XCTAssertThrowsError(try promise1.futureResult.wait().get(), "Lookup should have timed out and returned LookupError.timedOut") { error in
             XCTAssertEqual(error as? LookupError, LookupError.timedOut)
         }
+    }
+    
+    func testLookupShutdown() throws {
+        let eventLoop = eventLoopGroup.next()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        dnsClient.implementation.topNClosestInstances = { _ in
+            return eventLoop.makeSucceededFuture([])
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .minutes(1),
+            on: eventLoop
+        )
+        
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        
+        try! serviceDiscovery.shutdown().wait()
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        
+        serviceDiscovery.lookup(service1) {
+            promise1.succeed($0)
+        }
+        
+        XCTAssertThrowsError(try promise1.futureResult.wait().get(), "Lookup should have returned ServiceDiscoveryError.unavailable") { error in
+            XCTAssertEqual(error as? ServiceDiscoveryError, ServiceDiscoveryError.unavailable)
+        }
+    }
+    
+    func testSubscribe() throws {
+        let eventLoop = EmbeddedEventLoop()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        let accessCount = ManagedAtomic<Int>(1)
+        dnsClient.implementation.topNClosestInstances = { service in
+            let access = accessCount.load(ordering: .acquiring)
+            defer { accessCount.wrappingIncrement(ordering: .relaxed) }
+            
+            XCTAssertEqual(service.appName, "s1")
+            
+            // On every call, we change the IP address to simulate returning new instances every time
+            let ip = "::\(access)"
+            return eventLoop.makeSucceededFuture([try! .init(ipAddress: ip, port: 80)])
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .minutes(1),
+            updateInterval: .seconds(1), // Checks for instance updates every second
+            on: eventLoop
+        )
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        
+        eventLoop.advanceTime(by: .milliseconds(100)) // Advance time to let findAndRegister() work complete
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        let promise2 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        
+        let updateCount = ManagedAtomic<Int>(0)
+        let cancellationToken = serviceDiscovery.subscribe(to: service1) {
+            let count = updateCount.load(ordering: .acquiring)
+            defer { updateCount.wrappingIncrement(ordering: .relaxed) }
+            switch count {
+            case 0: promise1.succeed($0)
+            case 1: promise2.succeed($0)
+            default: XCTFail("nextResultHandler called too many times")
+            }
+        }
+        
+        XCTAssertFalse(cancellationToken.isCancelled)
+        
+        guard let firstInstances = try? promise1.futureResult.wait().get() else {
+            XCTFail("First batch of instances of subscription returned an error")
+            return
+        }
+        XCTAssertEqual(firstInstances, [try! .init(ipAddress: "::1", port: 80)])
+        
+        eventLoop.advanceTime(by: .milliseconds(1500)) // Advance time by 1.5 seconds, enough time for an instance update round to complete
+        
+        guard let secondInstances = try? promise2.futureResult.wait().get() else {
+            XCTFail("Second batch of instances of subscription returned an error")
+            return
+        }
+        XCTAssertEqual(secondInstances, [try! .init(ipAddress: "::2", port: 80)])
+        
+    }
+    
+    func testSubscribeWithContinuedInstanceError() throws {
+        
+    }
+    
+    func testSubscribeShutdown() throws {
+        
     }
 }

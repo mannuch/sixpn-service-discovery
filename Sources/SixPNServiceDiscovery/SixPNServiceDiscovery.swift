@@ -11,6 +11,7 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     public typealias Instance = SocketAddress
     
     private let _defaultLookupTimeout: TimeAmount
+    private let updateInterval: TimeAmount
     
     private let logger: Logger
     
@@ -30,10 +31,12 @@ public final class SixPNServiceDiscovery: ServiceDiscovery {
     public init(
         dnsClient: any SixPNDNSClient,
         defaultLookupTimeout: TimeAmount,
+        updateInterval: TimeAmount = .minutes(1),
         logger: Logger = .init(label: "swift-service-discovery.sixpn"),
         on eventLoop: EventLoop
     ) {
         self._defaultLookupTimeout = defaultLookupTimeout
+        self.updateInterval = updateInterval
         self.dnsClient = dnsClient
         self.logger = logger
         self.eventLoop = eventLoop
@@ -256,7 +259,7 @@ extension SixPNServiceDiscovery {
     
     private func updateServiceInstances() {
         // Schedule task to continually update instances
-        self.eventLoop.scheduleRepeatedAsyncTask(initialDelay: .zero, delay: .minutes(1)) { [weak self, eventLoop = self.eventLoop] task in
+        self.eventLoop.scheduleRepeatedAsyncTask(initialDelay: .zero, delay: self.updateInterval) { [weak self, eventLoop = self.eventLoop] task in
             guard let self, !self.isShutdown else {
                 task.cancel()
                 return eventLoop.makeSucceededVoidFuture()
@@ -267,7 +270,7 @@ extension SixPNServiceDiscovery {
             self.services.keys.sequencedFlatMapEach(on: self.eventLoop) { service in
                 self.logger.info("Looking for top \(service.topNClosestInstances) closest instances of service ['\(service.appName)', port: \(service.port)]")
                 let lookupPromise = eventLoop.makePromise(of: (SixPNService, [SocketAddress]).self)
-                // Each update should timeout after self._defaultLookupTimeout
+                // Each update should timeout after the default lookup timeout
                 let timeoutTask = eventLoop.scheduleTask(in: self._defaultLookupTimeout, {
                     struct TimeoutError: Error {}
                     self.logger.debug("Updating instances of service ['\(service.appName)', port: \(service.port)] timed out")
