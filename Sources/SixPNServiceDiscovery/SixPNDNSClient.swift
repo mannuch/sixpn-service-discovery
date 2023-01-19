@@ -134,9 +134,9 @@ public final class TestDNSClient: SixPNDNSClient {
 extension TestDNSClient.Implementation {
     static func unimplemented(on eventLoop: EventLoop) -> Self {
         .init(
-            allSixPNApps: XCTestDynamicOverlay.unimplemented("\(Self.self).allSixPNApps", placeholder: eventLoop.makeSucceededFuture([])),
-            topNClosestInstances: XCTestDynamicOverlay.unimplemented("\(Self.self).topNClosestInstances", placeholder: eventLoop.makeSucceededFuture([])),
-            close: XCTestDynamicOverlay.unimplemented("\(Self.self).close")
+            allSixPNApps: XCTUnimplemented("\(Self.self).allSixPNApps", placeholder: eventLoop.makeSucceededFuture([])),
+            topNClosestInstances: XCTUnimplemented("\(Self.self).topNClosestInstances", placeholder: eventLoop.makeSucceededFuture([])),
+            close: XCTUnimplemented("\(Self.self).close")
         )
     }
 }
