@@ -318,6 +318,9 @@ extension SixPNServiceDiscovery {
     }
 }
 
+// MARK: Sendable
+extension SixPNServiceDiscovery: Sendable {}
+
 
 extension DispatchTimeInterval {
     func toNIOTimeAmount() -> TimeAmount? {
