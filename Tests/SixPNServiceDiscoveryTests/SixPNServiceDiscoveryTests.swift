@@ -377,6 +377,43 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
         }
     }
     
+    func testLookupServiceNotFound() throws {
+        let eventLoop = eventLoopGroup.next()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        dnsClient.implementation.topNClosestInstances = { _ in
+            return eventLoop.makeSucceededFuture([])
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .minutes(1),
+            on: eventLoop
+        )
+        
+        
+        XCTAssertNoThrow(
+            try serviceDiscovery.findAndRegister(services: [service1]).wait()
+        )
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        let promise1 = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+        
+        let randomService = SixPNService(appName: "some-service", port: 82)
+        serviceDiscovery.lookup(randomService) {
+            promise1.succeed($0)
+        }
+        
+        XCTAssertThrowsError(try promise1.futureResult.wait().get(), "Lookup should have returned LookupError.unknownService") { error in
+            XCTAssertEqual(error as? LookupError, LookupError.unknownService)
+        }
+    }
+    
     func testSubscribe() throws {
         let eventLoop = EmbeddedEventLoop()
         dnsClient.implementation.allSixPNApps = {
@@ -561,5 +598,65 @@ final class SixPNServiceDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(completionReason, .serviceDiscoveryUnavailable)
         XCTAssertTrue(cancellationToken.isCancelled)
+    }
+    
+    func testConcurrency() throws {
+        let eventLoop = eventLoopGroup.any()
+        dnsClient.implementation.allSixPNApps = {
+            eventLoop.makeSucceededFuture(["s1"])
+        }
+        
+        let service1Instances: [SocketAddress] = [
+            try! .init(ipAddress: "::1", port: 80),
+            try! .init(ipAddress: "::2", port: 80),
+            try! .init(ipAddress: "::3", port: 80),
+            try! .init(ipAddress: "::4", port: 80),
+            try! .init(ipAddress: "::5", port: 80)
+        ]
+        
+        dnsClient.implementation.topNClosestInstances = { _ in
+            return eventLoop.makeSucceededFuture(service1Instances)
+        }
+        dnsClient.implementation.close = {}
+        
+        let service1 = SixPNService(appName: "s1", port: 80)
+        
+        let serviceDiscovery = SixPNServiceDiscovery(
+            dnsClient: dnsClient,
+            defaultLookupTimeout: .minutes(1),
+            on: eventLoop
+        )
+        try! serviceDiscovery.findAndRegister(services: [service1]).wait()
+        defer { try! serviceDiscovery.shutdown().wait() }
+        
+        var eventLoopFutures = [EventLoopFuture<[Result<[SocketAddress], Error>]>]()
+        
+        var eventLoops = eventLoopGroup.makeIterator()
+        while let eventLoop = eventLoops.next() {
+            let promise = eventLoop.makePromise(of: [Result<[SocketAddress], Error>].self)
+            eventLoop.execute {
+                (0..<1_000).map { i in
+                    let p = eventLoop.makePromise(of: Result<[SocketAddress], Error>.self)
+                    serviceDiscovery.lookup(service1) { p.succeed($0) }
+                    return p.futureResult
+                }
+                .flatten(on: eventLoop)
+                .cascade(to: promise)
+            }
+            
+            eventLoopFutures.append(promise.futureResult)
+        }
+        
+        let results = try! eventLoopFutures.flatten(on: eventLoopGroup.any()).wait()
+        results.forEach { lookupResults in
+            XCTAssertEqual(lookupResults.count, 1_000)
+            lookupResults.forEach { lookupResult in
+                guard case let .success(instances) = lookupResult else {
+                    XCTFail("Lookup result was an error")
+                    return
+                }
+                XCTAssertEqual(instances, service1Instances)
+            }
+        }
     }
 }
