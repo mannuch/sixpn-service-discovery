@@ -319,7 +319,7 @@ extension SixPNServiceDiscovery {
 }
 
 // MARK: Sendable
-extension SixPNServiceDiscovery: Sendable {}
+extension SixPNServiceDiscovery: @unchecked Sendable {}
 
 
 extension DispatchTimeInterval {
